@@ -1,0 +1,242 @@
+import boto3
+import subprocess
+import datetime
+import pandas as pd
+from datetime import date
+from datetime import timedelta
+from time import sleep
+import subprocess
+import time
+
+
+# In[2]:
+
+
+session = boto3.Session(region_name='eu-west-1')
+
+
+# In[3]:
+
+
+forecast = session.client('forecast')
+forecastquery = session.client('forecastquery')
+
+def last_day_of_month(any_day):
+    next_month = any_day.replace(day=28) + datetime.timedelta(days=4)  # this will never fail
+    return next_month - datetime.timedelta(days=next_month.day)
+
+today = date.today() 
+forecast_date = today + timedelta(days=365) 
+end_of_month = last_day_of_month(forecast_date)  
+forecast_horizon = (end_of_month - today).days
+
+
+# In[4]:
+
+
+s3 = session.client('s3')
+
+accountId = boto3.client('sts').get_caller_identity().get('Account')
+
+bucketName = "s3 bucket name".format(accountId)
+key="amazon_forecast/file_location.csv"
+roleArn = 'arn:aws:iam::215/ing'
+DATASET_FREQUENCY = "D"
+TIMESTAMP_FORMAT = "yyyy-MM-dd"
+project = 'campaign'
+datasetName= 'campaign_dataset'
+datasetGroupName= 'mc2_campaign_messaging_datasetgroup'
+s3DataPath = "s3://"+bucketName+"/"+key
+datasetImportJobName = 'mc2_campaign_messaging_import'
+forecastHorizon = forecast_horizon
+algorithmArn = 'arn:aws:forecast:::algorithm/Prophet'
+predictorName= project+'_pro_algo_mc2_campaign_messaging'
+forecastName= project+'_aml_forecast2_mc2_campaign_messaging'
+forecastExportName= 'mc2_campaign_messaging_all'
+outputPath="s3://"+bucketName+"/amazon_forecast/output_forecasts/mc2_campaign_messaging_forecast"
+key2="amazon_forecast/output_forecasts/mc2_campaign_messaging_forecast/"
+deleteprevfiles = 'amazon_forecast/output_forecasts/mc2_campaign_messaging_forecast/'
+
+
+# In[5]:
+
+
+s3 = boto3.resource("s3")
+bucket = s3.Bucket("marketing-clickatell-dev")
+
+for obj in bucket.objects.filter(Prefix=deleteprevfiles):
+    s3.Object(bucket.name,obj.key).delete()
+
+response = s3.Object(bucket.name,deleteprevfiles).put()
+
+
+# In[6]:
+
+
+schema ={
+	"Attributes": [
+		{
+			"AttributeName": "metric_name",
+			"AttributeType": "string"
+		},
+		{
+			"AttributeName": "timestamp",
+			"AttributeType": "timestamp"
+		},
+		{
+			"AttributeName": "metric_value",
+			"AttributeType": "float"
+		}
+	]
+}
+
+response=forecast.create_dataset(
+                    Domain="METRICS",
+                    DatasetType='TARGET_TIME_SERIES',
+                    DatasetName=datasetName,
+                    DataFrequency=DATASET_FREQUENCY, 
+                    Schema = schema
+                   )
+datasetArn = response['DatasetArn']
+
+
+# In[7]:
+
+
+create_dataset_group_response = forecast.create_dataset_group(DatasetGroupName=datasetGroupName,
+                                                              Domain="METRICS",
+                                                              DatasetArns= [datasetArn]
+                                                             )
+datasetGroupArn = create_dataset_group_response['DatasetGroupArn']
+
+
+ds_import_job_response=forecast.create_dataset_import_job(DatasetImportJobName=datasetImportJobName,
+                                                          DatasetArn=datasetArn,
+                                                          DataSource= {
+                                                              "S3Config" : {
+                                                                 "Path":s3DataPath,
+                                                                 "RoleArn": roleArn
+                                                              } 
+                                                          },
+                                                          TimestampFormat=TIMESTAMP_FORMAT
+                                                         )
+
+ds_import_job_arn=ds_import_job_response['DatasetImportJobArn']
+print(ds_import_job_arn)
+
+while True:
+    dataImportStatus = forecast.describe_dataset_import_job(DatasetImportJobArn=ds_import_job_arn)['Status']
+    print(dataImportStatus)
+    if dataImportStatus != 'ACTIVE' and dataImportStatus != 'CREATE_FAILED':
+        sleep(30)
+    else:
+        break
+
+
+# In[8]:
+
+
+create_predictor_response=forecast.create_predictor(PredictorName=predictorName, 
+                                                  AlgorithmArn=algorithmArn,
+                                                  ForecastHorizon=forecastHorizon,
+                                                  PerformAutoML= False,
+                                                  PerformHPO=False,
+                                                  EvaluationParameters= {"NumberOfBacktestWindows": 1, 
+                                                                         "BackTestWindowOffset": forecastHorizon}, 
+                                                  InputDataConfig= {"DatasetGroupArn": datasetGroupArn},
+                                                  FeaturizationConfig= {"ForecastFrequency": "D", 
+                                                                        "Featurizations": 
+                                                                        [
+                                                                          {"AttributeName": "metric_value", 
+                                                                           "FeaturizationPipeline": 
+                                                                            [
+                                                                              {"FeaturizationMethodName": "filling", 
+                                                                               "FeaturizationMethodParameters": 
+                                                                                {"frontfill": "none", 
+                                                                                 "middlefill": "zero", 
+                                                                                 "backfill": "zero"}
+                                                                              }
+                                                                            ]
+                                                                          }
+                                                                        ]
+                                                                       }
+                                                 )
+
+predictorArn=create_predictor_response['PredictorArn']
+
+while True:
+    predictorStatus = forecast.describe_predictor(PredictorArn=predictorArn)['Status']
+    print(predictorStatus)
+    if predictorStatus != 'ACTIVE' and predictorStatus != 'CREATE_FAILED':
+        sleep(30)
+    else:
+        break
+
+
+# In[9]:
+
+
+forecast.get_accuracy_metrics(PredictorArn=predictorArn)
+
+
+# In[10]:
+
+
+create_forecast_response=forecast.create_forecast(ForecastName=forecastName,
+                                                  PredictorArn=predictorArn)
+forecastArn = create_forecast_response['ForecastArn']
+
+while True:
+    forecastStatus = forecast.describe_forecast(ForecastArn=forecastArn)['Status']
+    print(forecastStatus)
+    if forecastStatus != 'ACTIVE' and forecastStatus != 'CREATE_FAILED':
+        sleep(30)
+    else:
+        break
+
+
+# In[11]:
+
+
+forecast_export_response = forecast.create_forecast_export_job(
+                                                                ForecastExportJobName = forecastExportName,
+                                                                ForecastArn=forecastArn, 
+                                                                Destination = {
+                                                                   "S3Config" : {
+                                                                       "Path":outputPath,
+                                                                       "RoleArn": roleArn
+                                                                   } 
+                                                                }
+                                                              )
+
+forecastExportJobArn = forecast_export_response['ForecastExportJobArn']
+
+while True:
+    forecastExportStatus = forecast.describe_forecast_export_job(ForecastExportJobArn=forecastExportJobArn)['Status']
+    print(forecastExportStatus)
+    if forecastExportStatus != 'ACTIVE' and forecastExportStatus != 'CREATE_FAILED':
+        sleep(30)
+    else:
+        break
+
+
+
+forecast.delete_forecast_export_job(ForecastExportJobArn=forecastExportJobArn)
+sleep(60)
+forecast.delete_forecast(ForecastArn=forecastArn)
+sleep(60)
+forecast.delete_predictor(PredictorArn=predictorArn)
+sleep(90)
+
+
+# In[14]:
+
+
+
+forecast.delete_dataset_import_job(DatasetImportJobArn=ds_import_job_arn)
+sleep(60)
+forecast.delete_dataset(DatasetArn=datasetArn)
+sleep(30)
+forecast.delete_dataset_group(DatasetGroupArn=datasetGroupArn)
+sleep(30)
+
